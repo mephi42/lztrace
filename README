@@ -1,0 +1,29 @@
+General information
+===================
+
+This is unrealized throw away code! Although API is quite stable :-) since there is _no_ external API.
+
+What currently work
+===================
+
+Simple tests works. Trace looks like:
+
+$ ./lztest 
+->[0x08048fe3] int main(int argc = <n/a>, char **argv = <n/a>)
+  ->[0x08048f17] int test()
+      ->[0x08048eb4] float yo(int i = 5, short int s = 7, long long unsigned int ull = 18446744073709551615, int j = 666666, int *p = 0xfffffffe, char c = 13, const char *str = "yo", double d = 567.890000, float f = 1.234568, long double ld = 9.876543)
+      <-[0x08048eb4] float yo() = 3.140000
+  <-[0x08048f17] int test() = 3
+<-[0x08048fe3] int main() = 0
+
+TODO
+====
+
+* full rework of return values handling needed (currently it's unportable and works just in simple cases)
+
+TODO optional
+=============
+
+Probable improvements:
+* implement lzprepare tool that processes dwarf info in target executable, builds hash for fast trace, strips debug info in target executable and appends hash as new a section (should be much smaller than .debug_info section). This section can be used at runtime for faster trace.
+* implement lztrace tool similar to ltrace, using ptrace system call and dwarf information to trace target executable internals.

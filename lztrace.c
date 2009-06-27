@@ -8,6 +8,7 @@
 #include <libelf.h>
 #include <dwarf.h>
 #include <assert.h>
+#include <pthread.h>
 
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -32,12 +33,44 @@
 
 /*
  * TODO:
- * - add location list for subroutine parameters handling
+ * - move all thread local data to one struct
  * - replace print_* callbacks with printing to buffer string
  * - add message string customization
  * - add optional thread and time info in trace
  * - add optional coloring of trace (+each thread tids in different colors)
  */
+
+#define THCOLOR        "\033[%dm"
+#define CLRESET        "\033[0m"
+#define CLBLACK        "\033[22;30m"
+#define CLRED          "\033[22;31m"
+#define CLGREEN        "\033[22;32m"
+#define CLBROWN        "\033[22;33m"
+#define CLBLUE         "\033[22;34m"
+#define CLMAGENTA      "\033[22;35m"
+#define CLCYAN         "\033[22;36m"
+#define CLGRAY         "\033[22;37m"
+#define CLDARKGRAY     "\033[01;30m"
+#define CLLIGHTRED     "\033[01;31m"
+#define CLLIGHTGREEN   "\033[01;32m"
+#define CLYELLOW       "\033[01;33m"
+#define CLLIGHTBLUE    "\033[01;34m"
+#define CLLIGHTMAGENTA "\033[01;35m"
+#define CLLIGHTCYAN    "\033[01;36m"
+#define CLWHITE        "\033[01;37m"
+#define CLBOLD         "\033[01m"
+#define CLUNBOLD       "\033[21m"
+
+__thread int logcolor = 0;
+
+int get_thread_color()
+{
+    static int last_busy = 0;
+    if (logcolor)
+        return logcolor;
+    logcolor = last_busy++ % 6 + 31; /* vt102 terminal colors */
+    return logcolor;
+}
 
 struct lztrace {
     Dwarf *dwarf_ptr;
@@ -53,6 +86,14 @@ struct type {
 	print_func print_func_ptr;
 	char name[256];
 };
+
+struct return_hook {
+	print_func print_val;
+	void *return_addr;
+};
+
+__thread int stacklevel = 0;
+__thread struct return_hook return_hook = { 0, 0 };
 
 static void __untraceable init_type(struct type *type_ptr)
 {
@@ -347,9 +388,10 @@ static int __untraceable dwarf_get_at_type(Dwarf_Die *die_ptr, struct type *type
 	return 0;
 }
 
-static void *__untraceable dwarf_get_param_location(Dwarf_Die *die_ptr, void *frame_addr)
+static void *__untraceable dwarf_get_param_location(Dwarf_Die *die_ptr, Dwarf_Addr func_addr, void *frame_addr)
 {
 	Dwarf_Attribute attr;
+	int res;
 
 	if (dwarf_hasattr(die_ptr, DW_AT_location)) {
 		dwarf_attr(die_ptr, DW_AT_location, &attr);
@@ -364,7 +406,8 @@ static void *__untraceable dwarf_get_param_location(Dwarf_Die *die_ptr, void *fr
 
 	Dwarf_Op *ops;
 	size_t op_num;
-	if (dwarf_getlocation(&attr, &ops, &op_num) == 0) {
+	res = dwarf_getlocation_addr(&attr, func_addr, &ops, &op_num, 1);
+	if (res > 0) {
 		if (op_num == 1) {
 			switch(ops[0].atom) {
 /*				case DW_OP_const1u:
@@ -380,6 +423,15 @@ static void *__untraceable dwarf_get_param_location(Dwarf_Die *die_ptr, void *fr
 			}
 		}
 	}
+/*	if (dwarf_getlocation(&attr, &ops, &op_num) == 0) {
+		if (op_num == 1) {
+			switch(ops[0].atom) {
+				case DW_OP_fbreg:
+					return (void*)(((char*)frame_addr) + 8 + ops[0].number);
+					break;
+			}
+		}
+	}*/
 	return errloc;
 }
 
@@ -387,6 +439,10 @@ static void __untraceable free_lztrace()
 {
 	if (!lztrace_ptr)
 		return;
+
+	if (return_hook.print_val != NULL) {
+		fprintf(lztrace_ptr->trace_file, "<trace ended>\n");
+	}
 
 	if (lztrace_ptr->dwarf_ptr != NULL)
 		dwarf_end(lztrace_ptr->dwarf_ptr);
@@ -425,7 +481,7 @@ static int __untraceable init_lztrace()
 	fd_self = open("/proc/self/exe", O_RDONLY);
 	if (fd_self == -1) {
 		perror("open /proc/self/exe");
-		exit(EXIT_FAILURE);
+		goto cleanup;
 	}
 
 	elf_version(EV_CURRENT);
@@ -526,7 +582,6 @@ static int __untraceable get_func(Dwarf_Die *die_ptr, const char *name, void *ad
 void __untraceable __cyg_profile_func_enter(void *this_fn, void *call_site);
 void __untraceable __cyg_profile_func_exit(void *this_fn, void *call_site);
 
-__thread int stacklevel = 0;
 void __untraceable __cyg_profile_func_enter(void *this_fn, void *call_site)
 {
     Dl_info this_fn_info;
@@ -547,6 +602,14 @@ void __untraceable __cyg_profile_func_enter(void *this_fn, void *call_site)
 		}
 	}
 
+	if (return_hook.print_val != NULL) {
+		/*
+		 * hook didn't run
+		 */
+		return_hook.print_val = NULL;
+		fprintf(lztrace_ptr->trace_file, "<inlined call ended>\n");
+	}
+
     stacklevel++;
     if (dladdr(this_fn, &this_fn_info)) {
 		if (get_func(&die, this_fn_info.dli_sname, this_fn) == 0) {
@@ -554,9 +617,12 @@ void __untraceable __cyg_profile_func_enter(void *this_fn, void *call_site)
 			init_type(&type);
 			dwarf_get_at_type(&die, &type);
 
-			fprintf(lztrace_ptr->trace_file, "%*s->[0x%.8lx] %s%s%s %s%s%s%s%s(",
+			get_thread_color();
+			fprintf(lztrace_ptr->trace_file, "%*s--"THCOLOR"%lu"CLRESET"->"/*[0x%.8lx frame:%p]*/" "CLGRAY"%s%s%s %s%s%s%s"CLYELLOW"%s"CLGRAY"("CLRESET,
 				(stacklevel - 1) * 2, "",
-				(long unsigned)this_fn,
+				logcolor, pthread_self(),
+			/*	(long unsigned)this_fn,
+				__builtin_frame_address(1),*/
 				type.flags & _const ? "const " : "",
 				type.flags & structure ? "struct " : "",
 				strlen(type.name) == 0 ? "void": type.name,
@@ -586,7 +652,7 @@ void __untraceable __cyg_profile_func_enter(void *this_fn, void *call_site)
 				init_type(&type);
 				dwarf_get_at_type(&child, &type);
 
-				fprintf(lztrace_ptr->trace_file, "%s%s%s%s %s%s%s%s%s",
+				fprintf(lztrace_ptr->trace_file, CLGRAY"%s%s%s%s %s%s%s"CLRESET"%s"CLGRAY"%s"CLRESET,
 					params ? ", " : "",
 					type.flags & _const ? "const " : "",
 					type.flags & structure ? "struct " : "",
@@ -599,23 +665,46 @@ void __untraceable __cyg_profile_func_enter(void *this_fn, void *call_site)
 
 				if (type.print_func_ptr) {
 					fprintf(lztrace_ptr->trace_file, " = ");
-					type.print_func_ptr(dwarf_get_param_location(&child, __builtin_frame_address(1)));
+					type.print_func_ptr(dwarf_get_param_location(&child, (long)this_fn, __builtin_frame_address(1)));
 				}
 
 				params = 1;
 
 			} while (!dwarf_siblingof(&child, &child));
 
-			fprintf(lztrace_ptr->trace_file, ")\n");
+			fprintf(lztrace_ptr->trace_file, CLGRAY")"CLRESET"\n");
+
+		} else {
+			get_thread_color();
+			fprintf(lztrace_ptr->trace_file, "%*s--"THCOLOR"%lu"CLRESET"-> "CLYELLOW"%s"CLGRAY"()"CLRESET"\n",
+				(stacklevel - 1) * 2, "",
+				logcolor, pthread_self(),
+				this_fn_info.dli_sname);
 		}
-		else
-			fprintf(lztrace_ptr->trace_file,
-					"%*s->[%p] %s()\n",
-						(stacklevel - 1) * 2,
-						"",
-						this_fn,
-						this_fn_info.dli_sname);
 	}
+}
+
+void __untraceable print_return_value(int value)
+{
+	assert(return_hook.print_val != NULL);
+	assert(return_hook.return_addr != NULL);
+	return_hook.print_val(&value);
+	return_hook.print_val = NULL;
+	fprintf(lztrace_ptr->trace_file, "\n");
+}
+
+/*
+ * FIXME: watch out returned via stack data corruption
+ */
+void __untraceable return_hook_callback()
+{
+	__asm__("\
+	sub		$4,%%esp;\
+	movl	%%eax,(%%esp);\
+	call	print_return_value;\
+	movl	(%%esp),%%eax;\
+	leave;\
+	jmp		*%0;" :: "m"(return_hook.return_addr));
 }
 
 void __untraceable __cyg_profile_func_exit(void *this_fn, void *call_site)
@@ -626,8 +715,6 @@ void __untraceable __cyg_profile_func_exit(void *this_fn, void *call_site)
 	 * - find another way of getting return value
 	 * (this one often failed)
 	 */
-	register int ebx asm ("ebx");
-	int rval = ebx;
 	int res;
 	Dwarf_Die die;
 	Dwarf_Addr addr = 0;
@@ -635,15 +722,24 @@ void __untraceable __cyg_profile_func_exit(void *this_fn, void *call_site)
 
 	assert(this_fn != __cyg_profile_func_enter && this_fn != __cyg_profile_func_exit);
 
+	if (return_hook.print_val != NULL) {
+		/*
+		 * hook didn't run
+		 */
+		return_hook.print_val = NULL;
+		fprintf(lztrace_ptr->trace_file, "<inlined call ended>\n");
+	}
+
     if (dladdr(this_fn, &this_fn_info)) {
 		if (get_func(&die, this_fn_info.dli_sname, this_fn) == 0) {
 			dwarf_lowpc(&die, &addr);
 			init_type(&type);
 			res = dwarf_get_at_type(&die, &type);
 
-			fprintf(lztrace_ptr->trace_file, "%*s<-[0x%.8lx] %s%s%s %s%s%s%s%s()",
+			fprintf(lztrace_ptr->trace_file, "%*s<-"THCOLOR"%lu"CLRESET"--"/*[0x%.8lx]*/" "CLGRAY"%s%s%s %s%s%s%s"CLYELLOW"%s"CLGRAY"()"CLRESET,
 				(stacklevel - 1) * 2, "",
-				(long unsigned)addr,
+				logcolor, pthread_self(),
+				/*(long unsigned)addr,*/
 				type.flags & _const ? "const " : "",
 				type.flags & structure ? "struct " : "",
 				strlen(type.name) == 0 ? "void": type.name,
@@ -654,19 +750,34 @@ void __untraceable __cyg_profile_func_exit(void *this_fn, void *call_site)
 				dwarf_diename(&die));
 
 			if (res == 0) {
-				fprintf(lztrace_ptr->trace_file, " = ");
-				type.print_func_ptr(&rval);
+				if ( *(void**)(__builtin_frame_address(1) + sizeof(void*)) == &return_hook_callback) {
+					fprintf(lztrace_ptr->trace_file, " = ");
+					return_hook.print_val = type.print_func_ptr;
+				} else {
+					fprintf(lztrace_ptr->trace_file, " = ");
+					return_hook.print_val = type.print_func_ptr;
+					return_hook.return_addr = *(void**)(__builtin_frame_address(1) + sizeof(void*));
+					*(void**)(__builtin_frame_address(1) + sizeof(void*)) = &return_hook_callback;
+				}
 			}
-			fprintf(lztrace_ptr->trace_file, "\n");
+			else
+				fprintf(lztrace_ptr->trace_file, "\n");
+
+		} else {
+			fprintf(lztrace_ptr->trace_file, "%*s<-"THCOLOR"%lu"CLRESET"-- "CLYELLOW"%s"CLGRAY"()"CLRESET" = ",
+				(stacklevel - 1) * 2, "",
+				logcolor, pthread_self(),
+				this_fn_info.dli_sname);
+
+			if ( *(void**)(__builtin_frame_address(1) + sizeof(void*)) == &return_hook_callback) {
+				return_hook.print_val = type.print_func_ptr;
+			} else {
+				return_hook.print_val = type.print_func_ptr;
+				return_hook.return_addr = *(void**)(__builtin_frame_address(1) + sizeof(void*));
+				*(void**)(__builtin_frame_address(1) + sizeof(void*)) = &return_hook_callback;
+			}
 		}
-		else
-	        fprintf(lztrace_ptr->trace_file,
-					"%*s<-[%p] %s() = %x\n",
-						(stacklevel - 1) * 2,
-						"",
-						this_fn,
-						this_fn_info.dli_sname,
-						rval);
 	}
+
     stacklevel--;
 }

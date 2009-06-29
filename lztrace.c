@@ -193,101 +193,27 @@ static void __untraceable dwarf_perror(const char *msg)
 	fprintf(stderr, "%s: %s\n", msg, dwarf_errmsg(dwarf_errno()));
 }
 
-static void __untraceable print_char(void *val)
-{
-	if (val != errloc)
-		fprintf(lztrace_ptr->trace_file, "%hhd", *(char*)val);
-	else
-		fprintf(lztrace_ptr->trace_file, "<n/a>");
+#define PRINT_TYPE_FUNC(name, format, cast) \
+static void __untraceable print_##name(void *val)\
+{\
+	if (val != errloc)\
+		fprintf(lztrace_ptr->trace_file, format, cast val);\
+	else\
+		fprintf(lztrace_ptr->trace_file, CLRED"<n/a>"CLRED);\
 }
 
-static void __untraceable print_short(void *val)
-{
-	if (val != errloc)
-		fprintf(lztrace_ptr->trace_file, "%hd", (int)(*(short*)val));
-	else
-		fprintf(lztrace_ptr->trace_file, "<n/a>");
-}
-
-static void __untraceable print_int(void *val)
-{
-	if (val != errloc)
-		fprintf(lztrace_ptr->trace_file, "%d", *(int*)val);
-	else
-		fprintf(lztrace_ptr->trace_file, "<n/a>");
-}
-
-static void __untraceable print_long_long(void *val)
-{
-	if (val != errloc)
-		fprintf(lztrace_ptr->trace_file, "%lld", *(long long*)val);
-	else
-		fprintf(lztrace_ptr->trace_file, "<n/a>");
-}
-
-static void __untraceable print_unsigned_char(void *val)
-{
-	if (val != errloc)
-		fprintf(lztrace_ptr->trace_file, "%hhu", *(unsigned char*)val);
-	else
-		fprintf(lztrace_ptr->trace_file, "<n/a>");
-}
-
-static void __untraceable print_unsigned_short(void *val)
-{
-	if (val != errloc)
-		fprintf(lztrace_ptr->trace_file, "%hu", (int)(*(unsigned*)val));
-	else
-		fprintf(lztrace_ptr->trace_file, "<n/a>");
-}
-
-static void __untraceable print_unsigned_int(void *val)
-{
-	if (val != errloc)
-		fprintf(lztrace_ptr->trace_file, "%u", *(unsigned int*)val);
-	else
-		fprintf(lztrace_ptr->trace_file, "<n/a>");
-}
-
-static void __untraceable print_unsigned_long_long(void *val)
-{
-	if (val != errloc)
-		fprintf(lztrace_ptr->trace_file, "%llu", *(unsigned long long*)val);
-	else
-		fprintf(lztrace_ptr->trace_file, "<n/a>");
-}
-
-static void __untraceable print_float(void *val)
-{
-	if (val != errloc)
-		fprintf(lztrace_ptr->trace_file, "%f", *(float*)val);
-	else
-		fprintf(lztrace_ptr->trace_file, "<n/a>");
-}
-
-static void __untraceable print_double(void *val)
-{
-	if (val != errloc)
-		fprintf(lztrace_ptr->trace_file, "%lf", *(double*)val);
-	else
-		fprintf(lztrace_ptr->trace_file, "<n/a>");
-}
-
-static void __untraceable print_long_double(void *val)
-{
-	if (val != errloc)
-		fprintf(lztrace_ptr->trace_file, "%Lf", *(long double*)val);
-	else
-		fprintf(lztrace_ptr->trace_file, "<n/a>");
-}
-
-static void __untraceable print_ptr(void *val)
-{
-	if (val != errloc)
-		fprintf(lztrace_ptr->trace_file, "%p", *(void**)val);
-	else
-		fprintf(lztrace_ptr->trace_file, "<n/a>");
-}
+PRINT_TYPE_FUNC(char, "%hhd", *(char*));
+PRINT_TYPE_FUNC(short, "%hd", (int)*(short*));
+PRINT_TYPE_FUNC(int, "%d", *(int*));
+PRINT_TYPE_FUNC(long_long, "%lld", *(long long*));
+PRINT_TYPE_FUNC(unsigned_char, "%hhu", *(unsigned char*));
+PRINT_TYPE_FUNC(unsigned_short, "%hu", (int)*(unsigned*));
+PRINT_TYPE_FUNC(unsigned_int, "%u", *(unsigned int*));
+PRINT_TYPE_FUNC(unsigned_long_long, "%llu", *(unsigned long long*));
+PRINT_TYPE_FUNC(float, "%f", *(float*));
+PRINT_TYPE_FUNC(double, "%lf", *(double*));
+PRINT_TYPE_FUNC(long_double, "%Lf", *(long double*));
+PRINT_TYPE_FUNC(ptr, "%p", *(void**));
 
 static jmp_buf stack_buf;
 static void __untraceable stopit(int unused)
@@ -626,7 +552,7 @@ static int __untraceable get_func(Dwarf_Die *die_ptr, const char *name, void *ad
         &abbrev_offset, &address_size, &offset_size) == 0) {
         off += header_size;
         if (dwarf_offdie(lztrace_ptr->dwarf_ptr, off, &cu_die) == NULL) {
-            fprintf(stderr, "Can't get CU die.\n");
+            fprintf(stderr, "cannot find CU die.\n");
 			return -1;
         }
 		res = dwarf_child(&cu_die, die_ptr);

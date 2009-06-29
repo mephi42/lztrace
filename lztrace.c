@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <elfutils/libdw.h>
 #include <libelf.h>
@@ -61,17 +62,6 @@
 #define CLBOLD         "\033[01m"
 #define CLUNBOLD       "\033[21m"
 
-__thread int logcolor = 0;
-
-int get_thread_color()
-{
-    static int last_busy = 0;
-    if (logcolor)
-        return logcolor;
-    logcolor = last_busy++ % 6 + 31; /* vt102 terminal colors */
-    return logcolor;
-}
-
 struct lztrace {
     Dwarf *dwarf_ptr;
     Elf *elf_ptr;
@@ -80,6 +70,22 @@ struct lztrace {
 
 typedef void (*print_func)(void *);
 
+/*
+unsigned char
+char
+unsigned short
+short
+unsigned int
+int
+unsigned long long
+long long
+float
+double
+long double
+void *
+c string
+*/
+
 struct type {
 	int size;
 	int flags;
@@ -87,13 +93,92 @@ struct type {
 	char name[256];
 };
 
-struct return_hook {
-	print_func print_val;
-	void *return_addr;
+#define DEFAULT_FRAMES 16
+#define ALT_STACK_SIZE 4096
+#define TRACE_BUF_SIZE 4096
+
+struct thread_data {
+	int stacklevel;
+	int frames_ptr_alloced;
+	void **frames_ptr;
+	int logcolor;
+	print_func print_val_callback;
+	char *buf_ptr;
+	char trace_buf[TRACE_BUF_SIZE];
 };
 
-__thread int stacklevel = 0;
-__thread struct return_hook return_hook = { 0, 0 };
+__thread struct thread_data *thread_data_ptr;
+/*
+ * Can't move this variables in thread_data_ptr,
+ * because they should be direct accessible from asm inlines
+ */
+__thread void *return_addr;
+__thread void *alt_stack;
+__thread long stack_reg;
+
+static int __untraceable extend_frames_array()
+{
+	void *p;
+
+	p = realloc(thread_data_ptr->frames_ptr, sizeof(void*) * thread_data_ptr->frames_ptr_alloced * 2);
+	if (p == NULL) {
+		fprintf(stderr, "tried to alloc %d\n", sizeof(void*) * thread_data_ptr->frames_ptr_alloced * 2);
+		perror("realloc");
+		return -1;
+	}
+	thread_data_ptr->frames_ptr = p;
+	thread_data_ptr->frames_ptr_alloced *= 2;
+	return 0;
+}
+
+static int __untraceable init_thread_data()
+{
+    static int last_busy_color = 0;
+
+	if (thread_data_ptr)
+		return 0;
+
+	alt_stack = NULL;
+
+	/*
+	 * FIXME: this memory never freed, not a big deal anyway
+	 */
+	thread_data_ptr = malloc(sizeof(struct thread_data));
+	if (thread_data_ptr == NULL) {
+		perror("malloc");
+		goto error;
+	}
+
+	thread_data_ptr->frames_ptr_alloced = DEFAULT_FRAMES / 2;
+	thread_data_ptr->frames_ptr = NULL;
+
+	if (extend_frames_array() == -1)
+		goto error;
+
+	alt_stack = malloc(ALT_STACK_SIZE);
+	if (alt_stack == NULL) {
+		perror("malloc");
+		goto error;
+	}
+
+    thread_data_ptr->logcolor = last_busy_color++ % 6 + 31; /* vt102 terminal colors */
+	thread_data_ptr->stacklevel = 0;
+	return_addr = NULL;
+	thread_data_ptr->print_val_callback = NULL;
+	return 0;
+
+error:
+	if (thread_data_ptr) {
+		if (thread_data_ptr->frames_ptr)
+			free(thread_data_ptr->frames_ptr);
+		free(thread_data_ptr), thread_data_ptr = NULL;
+	}
+
+	if (alt_stack)
+		free(alt_stack), alt_stack = NULL;
+
+	return -1;
+}
 
 static void __untraceable init_type(struct type *type_ptr)
 {
@@ -234,12 +319,15 @@ static void __untraceable print_string(void *val)
 
 	if (setjmp(stack_buf) == 0) {
 		for (i = 0; *p && i < buf_size; i++) {
+			if (!isprint(*p))
+				goto print_ptr;
 			buf[i] = *p++;
 		}
 		buf[i] = 0;
 		fprintf(lztrace_ptr->trace_file, "\"%.4096s\"", buf);
 	}
 	else {
+print_ptr:
 		fprintf(lztrace_ptr->trace_file, "%p", *(void**)val);
 	}
 
@@ -399,11 +487,6 @@ static void *__untraceable dwarf_get_param_location(Dwarf_Die *die_ptr, Dwarf_Ad
 	else
 		return errloc;
 
-/*	assert(dwarf_whatform(&attr) == DW_FORM_block4 ||
-			dwarf_whatform(&attr) == DW_FORM_block2 ||
-			dwarf_whatform(&attr) == DW_FORM_block1 ||
-			dwarf_whatform(&attr) == DW_FORM_block);*/
-
 	Dwarf_Op *ops;
 	size_t op_num;
 	res = dwarf_getlocation_addr(&attr, func_addr, &ops, &op_num, 1);
@@ -417,6 +500,9 @@ static void *__untraceable dwarf_get_param_location(Dwarf_Die *die_ptr, Dwarf_Ad
 				case DW_OP_addr:*/
 				case DW_OP_fbreg:
 /*				case DW_OP_plus_uconst:*/
+					/*
+					 * FIXME:
+					 */
 					return (void*)(((char*)frame_addr) + 8 + ops[0].number);
 /*					printf("|n=%d,n2=%d,off=%d|", (int)ops[0].number, (int)ops[0].number2, (int)ops[0].offset);*/
 					break;
@@ -440,7 +526,7 @@ static void __untraceable free_lztrace()
 	if (!lztrace_ptr)
 		return;
 
-	if (return_hook.print_val != NULL) {
+	if (thread_data_ptr && thread_data_ptr->print_val_callback) {
 		fprintf(lztrace_ptr->trace_file, "<trace ended>\n");
 	}
 
@@ -592,6 +678,7 @@ void __untraceable __cyg_profile_func_enter(void *this_fn, void *call_site)
 	int res;
 	int tag;
 	int params;
+	int inlined_call = 0;
 
 	assert(this_fn != __cyg_profile_func_enter && this_fn != __cyg_profile_func_exit);
 
@@ -602,25 +689,56 @@ void __untraceable __cyg_profile_func_enter(void *this_fn, void *call_site)
 		}
 	}
 
-	if (return_hook.print_val != NULL) {
+	if (!thread_data_ptr) {
+		if (init_thread_data() == -1) {
+			fprintf(stderr, "cannot init thread data\n");
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	if (thread_data_ptr->print_val_callback != NULL) {
 		/*
 		 * hook didn't run
 		 */
-		return_hook.print_val = NULL;
+		thread_data_ptr->print_val_callback = NULL;
 		fprintf(lztrace_ptr->trace_file, "<inlined call ended>\n");
 	}
 
-    stacklevel++;
+	if (thread_data_ptr->stacklevel > 0 &&
+		thread_data_ptr->frames_ptr[thread_data_ptr->stacklevel - 1] == __builtin_frame_address(1))
+			inlined_call = 1;
+
+	if (thread_data_ptr->stacklevel >= thread_data_ptr->frames_ptr_alloced)
+		extend_frames_array();
+	thread_data_ptr->frames_ptr[thread_data_ptr->stacklevel] = __builtin_frame_address(1);
+    thread_data_ptr->stacklevel++;
+
+	/*
+	 * TODO: inlined calls skipped by now. find a way to get inline offsets
+	 */
+	if (inlined_call)
+		return;
+
     if (dladdr(this_fn, &this_fn_info)) {
 		if (get_func(&die, this_fn_info.dli_sname, this_fn) == 0) {
 			dwarf_lowpc(&die, &addr);
 			init_type(&type);
 			dwarf_get_at_type(&die, &type);
 
-			get_thread_color();
+			if (inlined_call) {
+				fprintf(lztrace_ptr->trace_file, "%*s"THCOLOR"%lu"CLRESET/*[0x%.8lx frame:%p]*/" "CLGRAY" %s+0x%lx inlined call"CLRESET"\n",
+				(thread_data_ptr->stacklevel - 1) * 2, "",
+				thread_data_ptr->logcolor, pthread_self(),
+			/*	(long unsigned)this_fn,
+				__builtin_frame_address(1),*/
+				dwarf_diename(&die),
+				0x123L);
+				return;
+			}
+
 			fprintf(lztrace_ptr->trace_file, "%*s--"THCOLOR"%lu"CLRESET"->"/*[0x%.8lx frame:%p]*/" "CLGRAY"%s%s%s %s%s%s%s"CLYELLOW"%s"CLGRAY"("CLRESET,
-				(stacklevel - 1) * 2, "",
-				logcolor, pthread_self(),
+				(thread_data_ptr->stacklevel - 1) * 2, "",
+				thread_data_ptr->logcolor, pthread_self(),
 			/*	(long unsigned)this_fn,
 				__builtin_frame_address(1),*/
 				type.flags & _const ? "const " : "",
@@ -675,10 +793,9 @@ void __untraceable __cyg_profile_func_enter(void *this_fn, void *call_site)
 			fprintf(lztrace_ptr->trace_file, CLGRAY")"CLRESET"\n");
 
 		} else {
-			get_thread_color();
 			fprintf(lztrace_ptr->trace_file, "%*s--"THCOLOR"%lu"CLRESET"-> "CLYELLOW"%s"CLGRAY"()"CLRESET"\n",
-				(stacklevel - 1) * 2, "",
-				logcolor, pthread_self(),
+				(thread_data_ptr->stacklevel - 1) * 2, "",
+				thread_data_ptr->logcolor, pthread_self(),
 				this_fn_info.dli_sname);
 		}
 	}
@@ -686,13 +803,24 @@ void __untraceable __cyg_profile_func_enter(void *this_fn, void *call_site)
 
 void __untraceable print_return_value(int value)
 {
-	assert(return_hook.print_val != NULL);
-	assert(return_hook.return_addr != NULL);
-	return_hook.print_val(&value);
-	return_hook.print_val = NULL;
+	assert(thread_data_ptr->print_val_callback != NULL);
+	assert(return_addr != NULL);
+	thread_data_ptr->print_val_callback(&value);
+	thread_data_ptr->print_val_callback = NULL;
 	fprintf(lztrace_ptr->trace_file, "\n");
 }
-
+/*
+__i386__
+__amd64__
+__ppc__
+__ppc64__
+__arm__
+__x86_64__
+__ia64__
+__mips__
+__s390__
+*/
+#ifdef __i386__
 /*
  * FIXME: watch out returned via stack data corruption
  */
@@ -704,8 +832,12 @@ void __untraceable return_hook_callback()
 	call	print_return_value;\
 	movl	(%%esp),%%eax;\
 	leave;\
-	jmp		*%0;" :: "m"(return_hook.return_addr));
+	jmp		*%0;" :: "m"(return_addr));
 }
+#else
+# error "sorry, lztrace doesn't support other than x86 atchitectures by now"
+#endif
+
 
 void __untraceable __cyg_profile_func_exit(void *this_fn, void *call_site)
 {
@@ -722,12 +854,19 @@ void __untraceable __cyg_profile_func_exit(void *this_fn, void *call_site)
 
 	assert(this_fn != __cyg_profile_func_enter && this_fn != __cyg_profile_func_exit);
 
-	if (return_hook.print_val != NULL) {
+	if (thread_data_ptr->print_val_callback != NULL) {
 		/*
 		 * hook didn't run
 		 */
-		return_hook.print_val = NULL;
+		thread_data_ptr->print_val_callback = NULL;
 		fprintf(lztrace_ptr->trace_file, "<inlined call ended>\n");
+	}
+
+	if (thread_data_ptr->stacklevel > 1 &&
+		thread_data_ptr->frames_ptr[thread_data_ptr->stacklevel - 1] ==
+			thread_data_ptr->frames_ptr[thread_data_ptr->stacklevel - 2]) {
+		thread_data_ptr->stacklevel--;
+		return;
 	}
 
     if (dladdr(this_fn, &this_fn_info)) {
@@ -737,8 +876,8 @@ void __untraceable __cyg_profile_func_exit(void *this_fn, void *call_site)
 			res = dwarf_get_at_type(&die, &type);
 
 			fprintf(lztrace_ptr->trace_file, "%*s<-"THCOLOR"%lu"CLRESET"--"/*[0x%.8lx]*/" "CLGRAY"%s%s%s %s%s%s%s"CLYELLOW"%s"CLGRAY"()"CLRESET,
-				(stacklevel - 1) * 2, "",
-				logcolor, pthread_self(),
+				(thread_data_ptr->stacklevel - 1) * 2, "",
+				thread_data_ptr->logcolor, pthread_self(),
 				/*(long unsigned)addr,*/
 				type.flags & _const ? "const " : "",
 				type.flags & structure ? "struct " : "",
@@ -752,11 +891,11 @@ void __untraceable __cyg_profile_func_exit(void *this_fn, void *call_site)
 			if (res == 0) {
 				if ( *(void**)(__builtin_frame_address(1) + sizeof(void*)) == &return_hook_callback) {
 					fprintf(lztrace_ptr->trace_file, " = ");
-					return_hook.print_val = type.print_func_ptr;
+					thread_data_ptr->print_val_callback = type.print_func_ptr;
 				} else {
 					fprintf(lztrace_ptr->trace_file, " = ");
-					return_hook.print_val = type.print_func_ptr;
-					return_hook.return_addr = *(void**)(__builtin_frame_address(1) + sizeof(void*));
+					thread_data_ptr->print_val_callback = type.print_func_ptr;
+					return_addr = *(void**)(__builtin_frame_address(1) + sizeof(void*));
 					*(void**)(__builtin_frame_address(1) + sizeof(void*)) = &return_hook_callback;
 				}
 			}
@@ -765,19 +904,19 @@ void __untraceable __cyg_profile_func_exit(void *this_fn, void *call_site)
 
 		} else {
 			fprintf(lztrace_ptr->trace_file, "%*s<-"THCOLOR"%lu"CLRESET"-- "CLYELLOW"%s"CLGRAY"()"CLRESET" = ",
-				(stacklevel - 1) * 2, "",
-				logcolor, pthread_self(),
+				(thread_data_ptr->stacklevel - 1) * 2, "",
+				thread_data_ptr->logcolor, pthread_self(),
 				this_fn_info.dli_sname);
 
 			if ( *(void**)(__builtin_frame_address(1) + sizeof(void*)) == &return_hook_callback) {
-				return_hook.print_val = type.print_func_ptr;
+				thread_data_ptr->print_val_callback= type.print_func_ptr;
 			} else {
-				return_hook.print_val = type.print_func_ptr;
-				return_hook.return_addr = *(void**)(__builtin_frame_address(1) + sizeof(void*));
+				thread_data_ptr->print_val_callback= type.print_func_ptr;
+				return_addr = *(void**)(__builtin_frame_address(1) + sizeof(void*));
 				*(void**)(__builtin_frame_address(1) + sizeof(void*)) = &return_hook_callback;
 			}
 		}
 	}
 
-    stacklevel--;
+    thread_data_ptr->stacklevel--;
 }

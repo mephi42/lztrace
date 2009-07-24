@@ -34,7 +34,8 @@
 
 /*
  * TODO:
- * - move all thread local data to one struct
+ * - add return types > 4 bytes handling
+ * - stack switch in return hook
  * - replace print_* callbacks with printing to buffer string
  * - add message string customization
  * - add optional thread and time info in trace

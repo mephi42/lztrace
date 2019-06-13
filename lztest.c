@@ -1,6 +1,16 @@
 static float yo(int i, short s, unsigned long long ull, int j, int *p, char c,
 		const char *str, double d, float f, long double ld)
 {
+	(void)i;
+	(void)s;
+	(void)ull;
+	(void)j;
+	(void)p;
+	(void)c;
+	(void)str;
+	(void)d;
+	(void)f;
+	(void)ld;
 	return 3.14;
 }
 
@@ -13,7 +23,7 @@ static int test()
 	return (int)f;
 }
 
-int main(int argc, char *argv[])
+int main(void)
 {
 	return test();
 }

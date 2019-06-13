@@ -124,7 +124,7 @@ static int __untraceable extend_frames_array()
 	p = realloc(thread_data_ptr->frames_ptr,
 		    sizeof(void *) * thread_data_ptr->frames_ptr_alloced * 2);
 	if (p == NULL) {
-		fprintf(stderr, "tried to alloc %d\n",
+		fprintf(stderr, "tried to alloc %zd\n",
 			sizeof(void *) * thread_data_ptr->frames_ptr_alloced *
 				2);
 		perror("realloc");
@@ -223,6 +223,7 @@ PRINT_TYPE_FUNC(ptr, "%p", *(void **));
 static jmp_buf stack_buf;
 static void __untraceable stopit(int unused)
 {
+	(void)unused;
 	longjmp(stack_buf, 1);
 }
 
@@ -521,9 +522,9 @@ static int __untraceable init_lztrace()
 		goto cleanup;
 	}
 
-	res = elf_getshstrndx(lztrace_ptr->elf_ptr, &shstrndx);
+	res = elf_getshdrstrndx(lztrace_ptr->elf_ptr, &shstrndx);
 	if (res == -1) {
-		fprintf(stderr, "elf_getshstrndx: %s\n",
+		fprintf(stderr, "elf_getshdrstrndx: %s\n",
 			elf_errmsg(elf_errno()));
 		goto cleanup;
 	}
@@ -620,6 +621,7 @@ void __untraceable __cyg_profile_func_enter(void *this_fn, void *call_site)
 	int params;
 	int inlined_call = 0;
 
+	(void)call_site;
 	assert(this_fn != __cyg_profile_func_enter &&
 	       this_fn != __cyg_profile_func_exit);
 
@@ -809,6 +811,7 @@ void __untraceable __cyg_profile_func_exit(void *this_fn, void *call_site)
 	Dwarf_Addr addr = 0;
 	struct type type;
 
+	(void)call_site;
 	assert(this_fn != __cyg_profile_func_enter &&
 	       this_fn != __cyg_profile_func_exit);
 
